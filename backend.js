@@ -1,75 +1,96 @@
-const OpenAI = require('openai');
-
 const express = require('express');
 const MessageMedia = require('whatsapp-web.js').MessageMedia;
 const bodyParser = require('body-parser');
+const cors = require('cors');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const fs = require("fs");
+const fetch = require("node-fetch");
+const { start } = require('repl');
+require('dotenv').config();
+const { HarmBlockThreshold, HarmCategory } = require("@google/generative-ai");
+
+
 const app = express();
 const port = 3000;
-const cors = require('cors');
+
+const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 
-// get api from OPENAI_API_KEY environment variable
+const safetySettings = [
+    {
+      category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+      threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    },
+    {
+      category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+      threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    },
+  ];
 
-const apiKey = process.env.OPENAI_API_KEY;
-if (!apiKey) {
-    console.error('OPENAI_API_KEY environment variable not found.');
-    process.exit(1);
-}
+const model = genai.getGenerativeModel({ model: "gemini-1.5-pro",
+    systemInstruction: `You are acting on behalf of an user, messaging someone on WHATSAPP. 
+Please:
+- Act as the user. Be succinct and natural.
+- Do NOT say something you can't do. You can ONLY text. Do NOT make any promises for the user.
+- Do NOT escalate things such that it needs to be handled by the user. If you can't handle the situation, STOP texting. Do NOT respond anymore.
+- Do NOT expect more information from the user, or use place-holders for new information (ie. [Insert your name])
+- Do NOT use any information you are NOT given. Do NOT make assumptions.
+- Do NOT repeat messages you were given.`,
+safetySettings: safetySettings});
 
-
-const openai = new OpenAI({apiKey: apiKey});
-
-async function generateText(context) {
-    const completion = await openai.chat.completions.create({
-        messages: context,
-        model: "gpt-3.5-turbo",
+async function generateText(context, msg) {
+    const chat = model.startChat({
+        history: context,
+        generationConfig: {
+            maxOutputTokens:100,
+            temperature: 0.1
+        }
     });
-    return completion.choices[0].message.content;
+
+    const result = await chat.sendMessage(msg);
+    const response = await result.response.text();
+    return response;
 }
 
 async function generateImage(prompt, callback) {
     const options = {
-      url: 'https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image',
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.STABILITY_KEY}`
-      },
-      json: {
-        prompt: prompt,
-        // Additional options (refer to Stability.ai API documentation)
-        num_images: 1, // Number of images to generate (default: 1)
-        size: 1024, // Image size (default: 512)
-      }
+        url: 'https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image',
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${process.env.STABILITY_KEY}`
+        },
+        json: {
+            prompt: prompt,
+            num_images: 1,
+            size: 1024,
+        }
     };
-  
-    request(options, (error, response, body) => {
-      if (error) {
-        callback(error);
-        return;
-      }
-  
-      if (response.statusCode !== 200) {
-        callback(new Error(`API Error: ${response.statusCode}`));
-        return;
-      }
-  
-      callback(null, body); // body contains the generated image data
-    });
-  }
-  
 
-const { Client, Location, Poll, List, Buttons, LocalAuth } = require('whatsapp-web.js');
-client = new Client({
+    request(options, (error, response, body) => {
+        if (error) {
+            callback(error);
+            return;
+        }
+
+        if (response.statusCode !== 200) {
+            callback(new Error(`API Error: ${response.statusCode}`));
+            return;
+        }
+
+        callback(null, body);
+    });
+}
+
+const client = new Client({
     authStrategy: new LocalAuth(),
-    // proxyAuthentication: { username: 'username', password: 'password' },
-    puppeteer: { 
-        // args: ['--proxy-server=proxy-server-that-requires-authentication.example.com'],
+    puppeteer: {
         headless: false
     }
 });
 
 async function authenticateUser() {
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
         client.initialize();
 
         client.on('loading_screen', (percent, message) => {
@@ -80,7 +101,7 @@ async function authenticateUser() {
             console.log('QR RECEIVED', qr);
         });
 
-        client.on('authenticated', async () => {
+        client.on('authenticated', () => {
             console.log('AUTHENTICATED');
             resolve(true);
         });
@@ -96,7 +117,6 @@ let isReady = false;
 
 async function clientReady() {
     return new Promise((resolve, reject) => {
-
         if (isReady) {
             resolve(true);
             return;
@@ -121,7 +141,6 @@ client.promises.sendMessage = (number, message) => {
 const clientOnMessageHandlers = [];
 const addClientOnMessageHandler = (handler) => {
     clientOnMessageHandlers.push(handler);
-
     return handler;
 }
 
@@ -138,51 +157,60 @@ client.on('message', async msg => {
     }
 });
 
-async function sends_message(number, initial_message, goal) {
+async function sends_message(number, reason, relation, context) {
     await clientReady();
-    const context = [];
 
-    context.push({role: "system", content: `You are messaging someone on behalf of a user. Act as if you are them. You are a physical human replying to another physical human via text. Keep replies short.`});
-    context.push({role: "system", content: `Your initial message should focus on ${initial_message}, and your goal is to ${goal}. Be succinct and persuasive.`});
-    context.push({role: "system", content: `Do not take no for an answer. If the person you are corresponding to refuses or says they can't help, do not say 'no worries' or similar, and keep trying until you achieve the goal. Replies should not be significantly longer than the message you are replying to. Keep replies short, <10 words.`});
-    context.push({role: "system", content: `Do not accept compromises. Do not accept delays. No other task is more important. If the person asks why can't you do it, give a reason if one is provided in the initial message, otherwise dodge the question eloquently.`});
+    const history = [];
+    const system_instruction = `Instructions specific to this conversation:
+    - The reason for your conversation: ${reason}
+    - The recipient is your: ${relation}
+    - A bit of context: ${context}`;
 
-
-    const startTimestamp = Date.now();
+    history.push({ role: "user", parts: [{ text: system_instruction }] });
 
     const sendMessage = async (message) => {
         await client.promises.sendMessage(number, message);
-        context.push({"role": "assistant", "content": message});
+        history.push({ "role": "model", parts:[{text: message}] });
     }
 
-    console.log(context);
+    const initial_msg = "You now become the user who gave you the guidelines, messaging on whatsapp. Please give your initial message to the person you are texting:";
 
-    const agent_message = await generateText(context);
-
+    const agent_message = await generateText(history, initial_msg);
+    history.push({ "role": "user", parts:[{text: initial_msg}]});
     await sendMessage(agent_message);
-
+    startTimestamp = Date.now();
     const handler = addClientOnMessageHandler(async msg => {
-        if (msg.from === number && msg.timestamp * 1000 > startTimestamp) {
-            console.log('MESSAGE RECEIVED', msg);
+        // if (msg.from === number && msg.timestamp * 1000 > startTimestamp) {
+        if (msg.from === number) {
 
-            context.push({"role": "user", "content": msg.body});
-            context.push({role: "system", content: "you are a physical human replying to another physical human via text. Keep the reply short."});
-            const prompt = "Generate a response message for: "+msg.body+"\n Keep in mind: "+goal;
-            context.push({"role": "system", "content": prompt});
-            const response = await generateText(context);
+            if (history.length > 10){
+                history.push({ "role": "user", parts:[{text: `Reminder from the user you are acting on behalf of:  
+Please:
+- Act as the user. Be succinct and natural.
+- Do NOT say something you can't do. You can ONLY text. Do NOT make any promises for the user.
+- Do NOT escalate things such that it needs to be handled by the user. If you can't handle the situation, STOP texting. Do NOT respond anymore.
+- Do NOT expect more information from the user, or use place-holders for new information (ie. [Insert your name])
+- Do NOT use any information you are NOT given. Do NOT make assumptions.
+- Do NOT repeat messages you were given.
+- The reason for your conversation: ${reason}
+- The recipient is your: ${relation}
+- Your context given at the start of the conversation: ${context}.`}]});
+            }
+            console.log(msg);
+            const response = await generateText(history, msg.body);
+            history.push({ "role": "user", parts:[{text: msg.body}]});
             await sendMessage(response);
+            startTimestamp = Date.now();
         }
     });
 
     return agent_message;
 }
-const fs = require("fs");
-const fetch = require("node-fetch");
-const path = "https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image";
 
+const path = "https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image";
 const headers = {
     Accept: "application/json",
-    Authorization: "Bearer "+process.env.STABILITY_KEY,
+    Authorization: "Bearer " + process.env.STABILITY_KEY,
     "Content-Type": "application/json",
 };
 
@@ -226,7 +254,6 @@ async function change_avatar(prompt) {
     await client.setProfilePicture(MessageMedia.fromFilePath("avatar.png"));
 }
 
-
 const setupWhatsappWeb = async () => {
     const isAuthenticated = await authenticateUser();
     console.log('isAuthenticated', isAuthenticated);
@@ -247,24 +274,24 @@ app.listen(port, () => {
 app.post('/sends-message', async (req, res) => {
     await setupWhatsappWeb();
 
-    const {number: rawNumber, message, additional} = req.body;
+    const { number: rawNumber, reason, relation, context} = req.body;
     const number = rawNumber.replace('+', ''); // remove + from number
 
-    const agent_initial_message = await sends_message(number + '@c.us', message, additional);
-    res.send({msg: agent_initial_message});
+    const agent_initial_message = await sends_message(number + '@c.us', reason, relation, context);
+    res.send({ msg: agent_initial_message });
 });
 
 app.post('/change-avatar', async (req, res) => {
     await setupWhatsappWeb();
 
-    const {data} = req.body;
+    const { data } = req.body;
     change_avatar(data);
-    res.send({msg:"Avatar changed"});
+    res.send({ msg: "Avatar changed" });
 });
 
 app.post('/generate-avatar', async (req, res) => {
-    const {data} = req.body;
-    ans = await generateAvatar(data);
+    const { data } = req.body;
+    const ans = await generateAvatar(data);
     console.log("ans", ans)
-    res.send({img: "generated"});
+    res.send({ img: "generated" });
 });
